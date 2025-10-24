@@ -1,99 +1,173 @@
-# .github/workflows/subdomain-monitor.yml
+name: Subdomain Monitor
 
-name: 'Subdomain Monitor'
-
-# Run the workflow daily at 08:00 UTC and allow manual runs
 on:
   schedule:
-    - cron: '0 */6 * * *' # Runs every 6 hours at minute 0
-  workflow_dispatch: # Allows you to run this workflow manually from the Actions tab
+    # Runs every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Target domain to scan'
+        required: true
+        default: 'example.com'
+
+# Set permissions for the workflow
+permissions:
+  contents: write
 
 jobs:
   monitor:
-    name: 'Monitor Subdomains'
     runs-on: ubuntu-latest
-    
-    # Grant the action permission to commit to the repository
-    permissions:
-      contents: write
-
     steps:
-      - name: 'Checkout Repository'
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Fetch full history for context
+          persist-credentials: true
+          clean: true
+          fetch-depth: 1
 
-      - name: 'Setup Go Environment'
+      - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: 'stable'
+          go-version: '1.21'
 
-      - name: 'Install Subfinder'
-        run: go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-
-      - name: 'Run Subdomain Enumeration'
+      - name: Install subfinder
         run: |
-          # Run subfinder and save the output to a temporary file
-          subfinder -d ${{ secrets.DOMAIN_TO_MONITOR }} -o subdomains_new.txt
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
-      - name: 'Find New Subdomains'
-        id: find-new
+      - name: Verify installation
+        run: subfinder -version
+
+      - name: Run subfinder
+        env:
+          DOMAIN: ${{ github.event.inputs.domain || 'example.com' }}
         run: |
-          # --- إضافة تحقق جديد ---
-          # تأكد من أن الملف من الخطوة السابقة موجود
-          if [ ! -f subdomains_new.txt ]; then
-            echo "❌ Error: The file 'subdomains_new.txt' was not created."
-            echo "This usually means the 'subfinder' tool failed in the previous step."
-            echo "Please check the logs for the 'Run Subdomain Enumeration' step."
-            echo "A common cause is a missing or incorrect 'DOMAIN_TO_MONITOR' secret."
-            exit 1 # إنهاء التنفيذ بخطأ واضح
-          fi
-          # --- نهاية التحقق الجديد ---
+          subfinder -d "$DOMAIN" -silent -o current-subdomains.txt
+          echo "SUBDOMAINS_COUNT=$(wc -l < current-subdomains.txt)" >> $GITHUB_ENV
 
-          # Check if the old subdomains file exists
-          if [ -f subdomains.txt ]; then
-            echo "Old subdomain list found. Comparing..."
-            # Use 'comm' to find lines unique to the new list (the new subdomains)
-            comm -13 <(sort subdomains.txt) <(sort subdomains_new.txt) > new_subdomains.txt
+      - name: Check for previous results
+        id: check_previous
+        run: |
+          if [ -f previous-subdomains.txt ]; then
+            echo "previous_exists=true" >> $GITHUB_OUTPUT
+            echo "PREVIOUS_COUNT=$(wc -l < previous-subdomains.txt)" >> $GITHUB_ENV
           else
-            echo "No old subdomain list found. This is the first run."
-            # If it's the first run, all found subdomains are "new"
-            cp subdomains_new.txt new_subdomains.txt
+            echo "previous_exists=false" >> $GITHUB_OUTPUT
+            echo "PREVIOUS_COUNT=0" >> $GITHUB_ENV
           fi
 
-          # Set an output for the next step to check if new subdomains were found
-          if [ -s new_subdomains.txt ]; then
-            echo "new_found=true" >> $GITHUB_OUTPUT
-          else
-            echo "new_found=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: 'Send Discord Notification'
-        if: steps.find-new.outputs.new_found == 'true' # Only run if new subdomains were found
+      - name: Compare with previous results
+        if: steps.check_previous.outputs.previous_exists == 'true'
         run: |
-          # Format the message for Discord using a code block for readability
-          NEW_SUBDOMAINS=$(cat new_subdomains.txt)
-          MESSAGE="🚨 **New Subdomains Found for ${{ secrets.DOMAIN_TO_MONITOR }}** 🚨\n\`\`\`\n${NEW_SUBDOMAINS}\n\`\`\`"
+          # Sort both files and find new subdomains
+          sort current-subdomains.txt > current-sorted.txt
+          sort previous-subdomains.txt > previous-sorted.txt
+          comm -23 current-sorted.txt previous-sorted.txt > new-subdomains.txt
+          echo "NEW_COUNT=$(wc -l < new-subdomains.txt)" >> $GITHUB_ENV
           
-          # Send the payload to Discord using curl
-          curl -X POST -H 'Content-Type: application/json' \
-            -d "{\"content\": \"$MESSAGE\"}" \
-            ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # Also find removed subdomains
+          comm -13 current-sorted.txt previous-sorted.txt > removed-subdomains.txt
+          echo "REMOVED_COUNT=$(wc -l < removed-subdomains.txt)" >> $GITHUB_ENV
 
-      - name: 'Update Subdomain State'
+      - name: Prepare Discord notification
+        env:
+          DOMAIN: ${{ github.event.inputs.domain || 'example.com' }}
         run: |
-          # Replace the old list with the new, complete list for the next run
-          mv subdomains_new.txt subdomains.txt
-
-      - name: 'Commit Updated Subdomain List'
-        run: |
-          git config --local user.email "${{ secrets.GIT_COMMIT_EMAIL }}"
-          git config --local user.name "${{ secrets.GIT_COMMIT_USERNAME }}"
-          git add subdomains.txt
-          # Only commit if there are actual changes to the file
-          if git diff --staged --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "chore: Update subdomain list [skip ci]"
-            git push
+          # Format current subdomains (limit to 15)
+          CURRENT_SUBDOMAINS=$(head -n 15 current-subdomains.txt | sed 's/^/- /')
+          if [ $SUBDOMAINS_COUNT -gt 15 ]; then
+            CURRENT_SUBDOMAINS="$CURRENT_SUBDOMAINS\n... and $((SUBDOMAINS_COUNT - 15)) more"
           fi
+          
+          # Format previous subdomains (limit to 15)
+          if [ $PREVIOUS_COUNT -gt 0 ]; then
+            PREV_SUBDOMAINS=$(head -n 15 previous-subdomains.txt | sed 's/^/- /')
+            if [ $PREVIOUS_COUNT -gt 15 ]; then
+              PREV_SUBDOMAINS="$PREV_SUBDOMAINS\n... and $((PREVIOUS_COUNT - 15)) more"
+            fi
+          else
+            PREV_SUBDOMAINS="No previous data"
+          fi
+          
+          # Format new subdomains (limit to 10)
+          if [ "$previous_exists" == "true" ] && [ $NEW_COUNT -gt 0 ]; then
+            NEW_SUBDOMAINS=$(head -n 10 new-subdomains.txt | sed 's/^/- /')
+            if [ $NEW_COUNT -gt 10 ]; then
+              NEW_SUBDOMAINS="$NEW_SUBDOMAINS\n... and $((NEW_COUNT - 10)) more"
+            fi
+          else
+            NEW_SUBDOMAINS="None"
+          fi
+          
+          # Format removed subdomains (limit to 10)
+          if [ "$previous_exists" == "true" ] && [ $REMOVED_COUNT -gt 0 ]; then
+            REMOVED_SUBDOMAINS=$(head -n 10 removed-subdomains.txt | sed 's/^/- /')
+            if [ $REMOVED_COUNT -gt 10 ]; then
+              REMOVED_SUBDOMAINS="$REMOVED_SUBDOMAINS\n... and $((REMOVED_COUNT - 10)) more"
+            fi
+          else
+            REMOVED_SUBDOMAINS="None"
+          fi
+          
+          # Create Discord embed
+          PAYLOAD=$(jq -n \
+            --arg title "Subdomain Report for $DOMAIN" \
+            --arg current "$SUBDOMAINS_COUNT" \
+            --arg previous "$PREVIOUS_COUNT" \
+            --arg new "$NEW_COUNT" \
+            --arg removed "$REMOVED_COUNT" \
+            --arg currentlist "$CURRENT_SUBDOMAINS" \
+            --arg prevlist "$PREV_SUBDOMAINS" \
+            --arg newlist "$NEW_SUBDOMAINS" \
+            --arg removedlist "$REMOVED_SUBDOMAINS" \
+            '{
+              "embeds": [{
+                "title": $title,
+                "color": 5814783,
+                "fields": [
+                  {"name": "Current Subdomains", "value": $current, "inline": true},
+                  {"name": "Previous Subdomains", "value": $previous, "inline": true},
+                  {"name": "New Subdomains", "value": $new, "inline": true},
+                  {"name": "Removed Subdomains", "value": $removed, "inline": true},
+                  {"name": "Current Subdomains", "value": $currentlist},
+                  {"name": "Previous Subdomains", "value": $prevlist},
+                  {"name": "New Subdomains", "value": $newlist},
+                  {"name": "Removed Subdomains", "value": $removedlist}
+                ],
+                "footer": {"text": "RobustaStudio Subdomain Monitor"}
+              }]
+            }')
+          
+          echo "PAYLOAD<<EOF" >> $GITHUB_ENV
+          echo "$PAYLOAD" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Send to Discord
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$WEBHOOK_URL"
+
+      - name: Update previous results
+        run: |
+          cp current-subdomains.txt previous-subdomains.txt
+
+      - name: Commit and push changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add previous-subdomains.txt
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update previous subdomains list"
+            git push origin main
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f current-subdomains.txt previous-subdomains.txt new-subdomains.txt removed-subdomains.txt current-sorted.txt previous-sorted.txt

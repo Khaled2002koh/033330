@@ -1,0 +1,88 @@
+# .github/workflows/subdomain-monitor.yml
+
+name: 'Subdomain Monitor'
+
+# Run the workflow daily at 08:00 UTC and allow manual runs
+on:
+  schedule:
+    - cron: '0 */6 * * *' # Runs every 6 hours at minute 0
+  workflow_dispatch: # Allows you to run this workflow manually from the Actions tab
+
+jobs:
+  monitor:
+    name: 'Monitor Subdomains'
+    runs-on: ubuntu-latest
+    
+    # Grant the action permission to commit to the repository
+    permissions:
+      contents: write
+
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch full history for context
+
+      - name: 'Setup Go Environment'
+        uses: actions/setup-go@v4
+        with:
+          go-version: 'stable'
+
+      - name: 'Install Subfinder'
+        run: go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+
+      - name: 'Run Subdomain Enumeration'
+        run: |
+          # Run subfinder and save the output to a temporary file
+          subfinder -d ${{ secrets.DOMAIN_TO_MONITOR }} -o subdomains_new.txt
+
+      - name: 'Find New Subdomains'
+        id: find-new
+        run: |
+          # Check if the old subdomains file exists
+          if [ -f subdomains.txt ]; then
+            echo "Old subdomain list found. Comparing..."
+            # Use 'comm' to find lines unique to the new list (the new subdomains)
+            comm -13 <(sort subdomains.txt) <(sort subdomains_new.txt) > new_subdomains.txt
+          else
+            echo "No old subdomain list found. This is the first run."
+            # If it's the first run, all found subdomains are "new"
+            cp subdomains_new.txt new_subdomains.txt
+          fi
+
+          # Set an output for the next step to check if new subdomains were found
+          if [ -s new_subdomains.txt ]; then
+            echo "new_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "new_found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 'Send Discord Notification'
+        if: steps.find-new.outputs.new_found == 'true' # Only run if new subdomains were found
+        run: |
+          # Format the message for Discord using a code block for readability
+          NEW_SUBDOMAINS=$(cat new_subdomains.txt)
+          MESSAGE="🚨 **New Subdomains Found for ${{ secrets.DOMAIN_TO_MONITOR }}** 🚨\n\`\`\`\n${NEW_SUBDOMAINS}\n\`\`\`"
+          
+          # Send the payload to Discord using curl
+          curl -X POST -H 'Content-Type: application/json' \
+            -d "{\"content\": \"$MESSAGE\"}" \
+            ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+      - name: 'Update Subdomain State'
+        run: |
+          # Replace the old list with the new, complete list for the next run
+          mv subdomains_new.txt subdomains.txt
+
+      - name: 'Commit Updated Subdomain List'
+        run: |
+          git config --local user.email "${{ secrets.GIT_COMMIT_EMAIL }}"
+          git config --local user.name "${{ secrets.GIT_COMMIT_USERNAME }}"
+          git add subdomains.txt
+          # Only commit if there are actual changes to the file
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: Update subdomain list [skip ci]"
+            git push
+          fi

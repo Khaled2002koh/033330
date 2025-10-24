@@ -39,6 +39,17 @@ jobs:
       - name: 'Find New Subdomains'
         id: find-new
         run: |
+          # --- إضافة تحقق جديد ---
+          # تأكد من أن الملف من الخطوة السابقة موجود
+          if [ ! -f subdomains_new.txt ]; then
+            echo "❌ Error: The file 'subdomains_new.txt' was not created."
+            echo "This usually means the 'subfinder' tool failed in the previous step."
+            echo "Please check the logs for the 'Run Subdomain Enumeration' step."
+            echo "A common cause is a missing or incorrect 'DOMAIN_TO_MONITOR' secret."
+            exit 1 # إنهاء التنفيذ بخطأ واضح
+          fi
+          # --- نهاية التحقق الجديد ---
+
           # Check if the old subdomains file exists
           if [ -f subdomains.txt ]; then
             echo "Old subdomain list found. Comparing..."

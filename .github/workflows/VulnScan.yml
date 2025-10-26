@@ -6,7 +6,7 @@ on:
       domain:
         description: 'Domain to scan'
         required: true
-        default: 'example.com'
+        default: 'seekasia.com'
   schedule:
     - cron: '0 6 * * *'  # Every Monday at 6 AM UTC
 
